@@ -16,6 +16,8 @@ use std::iter::FromIterator;
 use std::ops::Bound;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::thread;
+use std::cmp;
 
 static TORCH_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static NUMPY_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
@@ -453,6 +455,30 @@ impl Open {
             Storage::Mmap(mmap) => {
                 let data =
                     &mmap[info.data_offsets.0 + self.offset..info.data_offsets.1 + self.offset];
+
+                // SSDs perform much better if multiple sequences are read in parallel, rather than
+                // reading the whole blob from the beginning till the end in a single thread.
+                // 32 concurrent reads are usually enough. This doesn't depend on the CPU hardware
+                // concurrency (number of logical cores), because the threads launched here are
+                // I/O bound.
+                let n_workers = 32;
+                let total_bytes = data.len();
+                let bytes_per_worker = (total_bytes + n_workers - 1) / n_workers;
+                thread::scope(|scope| {
+                    for i in 0..32 {
+                        scope.spawn(move || {
+                            let i_first = bytes_per_worker * i;
+                            let i_limit = cmp::min(total_bytes, bytes_per_worker * (i+1));
+                            let page_size = 4096;
+                            for j in (i_first..i_limit).step_by(page_size) {
+                                unsafe {
+                                    let data_ptr = data.as_ptr();
+                                    std::ptr::read_volatile(data_ptr.offset(j.try_into().unwrap()));
+                                }
+                            }
+                        });
+                    }
+                });
 
                 let array: PyObject = Python::with_gil(|py| PyByteArray::new(py, data).into_py(py));
 
