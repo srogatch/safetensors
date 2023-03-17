@@ -321,6 +321,12 @@ struct Open {
     storage: Arc<Storage>,
 }
 
+#[derive(Copy, Clone)]
+struct PtrWrapper(*const u8);
+
+unsafe impl Sync for PtrWrapper {}
+unsafe impl Send for PtrWrapper {}
+
 impl Open {
     fn new(filename: PathBuf, framework: Framework, device: Option<Device>) -> PyResult<Self> {
         let file = File::open(&filename).map_err(|_| {
@@ -464,21 +470,24 @@ impl Open {
                 let n_workers = 32;
                 let total_bytes = data.len();
                 let bytes_per_worker = (total_bytes + n_workers - 1) / n_workers;
-                thread::scope(|scope| {
-                    for i in 0..32 {
-                        scope.spawn(move || {
-                            let i_first = bytes_per_worker * i;
-                            let i_limit = cmp::min(total_bytes, bytes_per_worker * (i+1));
-                            let page_size = 4096;
-                            for j in (i_first..i_limit).step_by(page_size) {
-                                unsafe {
-                                    let data_ptr = data.as_ptr();
-                                    std::ptr::read_volatile(data_ptr.offset(j.try_into().unwrap()));
+                let page_size = 4096;
+                let data_ptr = PtrWrapper(data.as_ptr());
+                if bytes_per_worker >= page_size {
+                    thread::scope(|scope| {
+                        for i in 0..n_workers {
+                            scope.spawn(move || {
+                                let _ = &data_ptr;
+                                let i_first = bytes_per_worker * i;
+                                let i_limit = cmp::min(total_bytes, bytes_per_worker * (i+1));
+                                for j in (i_first..i_limit).step_by(page_size) {
+                                    unsafe {
+                                        std::ptr::read_volatile(data_ptr.0.offset(j.try_into().unwrap()));
+                                    }
                                 }
-                            }
-                        });
-                    }
-                });
+                            });
+                        }
+                    });
+                }
 
                 let array: PyObject = Python::with_gil(|py| PyByteArray::new(py, data).into_py(py));
 
