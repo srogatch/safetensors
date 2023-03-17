@@ -1,6 +1,6 @@
 #![deny(missing_docs)]
 //! Dummy doc
-use memmap2::{Mmap, MmapOptions};
+use memmap2::{Mmap, MmapOptions, Advice};
 use pyo3::exceptions::{PyException, PyFileNotFoundError};
 use pyo3::once_cell::GILOnceCell;
 use pyo3::prelude::*;
@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 use std::cmp;
+use std::ptr;
 
 static TORCH_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
 static NUMPY_MODULE: GILOnceCell<Py<PyModule>> = GILOnceCell::new();
@@ -322,8 +323,12 @@ struct Open {
 }
 
 #[derive(Copy, Clone)]
-struct PtrWrapper(*const u8);
+struct CPtrWrapper(*const u8);
+unsafe impl Sync for CPtrWrapper {}
+unsafe impl Send for CPtrWrapper {}
 
+#[derive(Copy, Clone)]
+struct PtrWrapper(*mut u8);
 unsafe impl Sync for PtrWrapper {}
 unsafe impl Send for PtrWrapper {}
 
@@ -343,6 +348,10 @@ impl Open {
         // SAFETY: Mmap is used to prevent allocating in Rust
         // before making a copy within Python.
         let buffer = unsafe { MmapOptions::new().map(&file)? };
+        // TODO: According to Rust documentation, this is only implemented for Linux.
+        // On the other systems, native API calls are needed, such as
+        // PrefetchVirtualMemory() on Windows
+        buffer.advise(Advice::Sequential);
 
         let (n, metadata) = SafeTensors::read_metadata(&buffer).map_err(|e| {
             SafetensorError::new_err(format!("Error while deserializing header: {e:?}"))
@@ -462,34 +471,35 @@ impl Open {
                 let data =
                     &mmap[info.data_offsets.0 + self.offset..info.data_offsets.1 + self.offset];
 
-                // SSDs perform much better if multiple sequences are read in parallel, rather than
-                // reading the whole blob from the beginning till the end in a single thread.
-                // 32 concurrent reads are usually enough. This doesn't depend on the CPU hardware
-                // concurrency (number of logical cores), because the threads launched here are
-                // I/O bound.
-                let n_workers = 32;
-                let total_bytes = data.len();
-                let bytes_per_worker = (total_bytes + n_workers - 1) / n_workers;
-                let page_size = 4096;
-                let data_ptr = PtrWrapper(data.as_ptr());
-                if bytes_per_worker >= page_size {
-                    thread::scope(|scope| {
-                        for i in 0..n_workers {
-                            scope.spawn(move || {
-                                let _ = &data_ptr;
-                                let i_first = bytes_per_worker * i;
-                                let i_limit = cmp::min(total_bytes, bytes_per_worker * (i+1));
-                                for j in (i_first..i_limit).step_by(page_size) {
-                                    unsafe {
-                                        std::ptr::read_volatile(data_ptr.0.offset(j.try_into().unwrap()));
-                                    }
+                    let array: PyObject = Python::with_gil(|py| {
+                        let array1: PyObject = PyByteArray::new_with(py, data.len(), |bytes: &mut [u8]| {
+                            // SSDs perform much better if multiple sequences are read in parallel, rather than
+                            // reading the whole blob from the beginning till the end in a single thread.
+                            // 128 concurrent reads are usually enough. This doesn't depend on the CPU hardware
+                            // concurrency (number of logical cores), because the threads launched here are
+                            // I/O bound.
+                            let n_workers = 128;
+                            let total_bytes = data.len();
+                            let bytes_per_worker = (total_bytes + n_workers - 1) / n_workers;
+                            let src_ptr = CPtrWrapper(data.as_ptr());
+                            let dest_ptr = PtrWrapper(bytes.as_mut_ptr());
+                            thread::scope(|scope| {
+                                for i in 0..n_workers {
+                                    scope.spawn(move || {
+                                        let _ = &src_ptr;
+                                        let _ = &dest_ptr;
+                                        let i_first = bytes_per_worker * i;
+                                        let i_limit = cmp::min(total_bytes, bytes_per_worker * (i+1));
+                                        unsafe {
+                                            ptr::copy_nonoverlapping(src_ptr.0.add(i_first), dest_ptr.0.add(i_first), i_limit-i_first);
+                                        }
+                                    });
                                 }
                             });
-                        }
+                            Ok(())
+                        }).unwrap().into_py(py);
+                        array1
                     });
-                }
-
-                let array: PyObject = Python::with_gil(|py| PyByteArray::new(py, data).into_py(py));
 
                 create_tensor(
                     &self.framework,
